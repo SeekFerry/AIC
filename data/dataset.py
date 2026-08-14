@@ -174,7 +174,6 @@ def create_dataloader(
     ), dataset
 
 # 无限重复采样器的 DataLoader:训练时避免每个 epoch 重建 worker,提速。
-
 class InfiniteDataLoader(dataloader.DataLoader):
     """Dataloader that reuses workers.
 
@@ -199,7 +198,6 @@ class InfiniteDataLoader(dataloader.DataLoader):
             yield next(self.iterator)
 
 # 无限重复的采样器,配合 InfiniteDataLoader 使用。
-
 class _RepeatSampler:
     """Sampler that repeats forever.
 
@@ -215,9 +213,8 @@ class _RepeatSampler:
         """Provides an iterator that infinitely repeats over a given `sampler` object."""
         while True:
             yield from iter(self.sampler)
+
 # 推理/验证加载器:扫目录/图片/视频,逐张返回 (path, 预处理后的图, 原图, cap, 信息串)。
-
-
 class LoadImages:
     """Loads images and videos for YOLOv3 from various sources, including directories and '*.txt' path lists."""
 
@@ -308,14 +305,14 @@ class LoadImages:
 
         return path, im, im0, self.cap, s
 
-    # 打开一个新的视频文件,统计总帧数与旋转方向元数据。
+# （删）打开一个新的视频文件,统计总帧数与旋转方向元数据。
     def _new_video(self, path):
         """Initializes a video capture object with frame counting and orientation from a given path."""
         self.frame = 0
         self.cap = cv2.VideoCapture(path)
         self.frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) / self.vid_stride)
         self.orientation = int(self.cap.get(cv2.CAP_PROP_ORIENTATION_META))  # rotation degrees
-# 按视频元数据里的旋转角度旋转图像(用于视频帧)。
+# （删）按视频元数据里的旋转角度旋转图像(用于视频帧)。
     
     def _cv2_rotate(self, im):
         """Rotates a cv2 image based on the video's metadata orientation; returns the rotated image."""
@@ -332,7 +329,6 @@ class LoadImages:
         return self.nf  # number of files
 
 # 训练 Dataset:扫路径、校验并缓存标签(*.cache)、矩形批、RAM/磁盘缓存;__getitem__ 完成 Mosaic/MixUp/letterbox/翻转/HSV 全流程。
-
 class LoadImagesAndLabels(Dataset):
     """Loads images and labels for YOLOv3 training and validation with support for augmentations and caching."""
 
@@ -548,8 +544,8 @@ class LoadImagesAndLabels(Dataset):
                     b += self.ims[i].nbytes
                 pbar.desc = f"{prefix}Caching images ({b / gb:.1f}GB {cache_images})"
             pbar.close()
+
 # 估算整库缓存所需 RAM,不够则返回 False 以关闭缓存。
-    
     def check_cache_ram(self, safety_margin=0.1, prefix=""):
         """Evaluates if there's enough RAM to cache dataset images, considering a safety margin."""
         b, gb = 0, 1 << 30  # bytes of cached images, bytes per gigabytes
@@ -567,8 +563,8 @@ class LoadImagesAndLabels(Dataset):
                 f"{mem.available / gb:.1f}/{mem.total / gb:.1f}GB available, not caching images ⚠️"
             )
         return cache
-# 多进程扫描所有图+标签,校验合法性并写 *.cache,加速后续加载。
     
+# 多进程扫描所有图+标签,校验合法性并写 *.cache,加速后续加载。
     def cache_labels(self, path=Path("./labels.cache"), prefix=""):
         """Caches dataset labels, checks image existence and readability, and records image shapes and segments."""
         x = {}  # dict
@@ -607,13 +603,13 @@ class LoadImagesAndLabels(Dataset):
         except Exception as e:
             LOGGER.warning(f"{prefix}Cache directory {path.parent} is not writeable: {e}")  # not writeable
         return x
-# 返回数据集图像数量。
     
+# 返回数据集图像数量。
     def __len__(self):
         """Returns the number of image files in the dataset."""
         return len(self.im_files)
-# 取第 index 个样本:走 Mosaic/MixUp 或 letterbox+透视,再做 HSV/翻转,最后转 CHW、BGR->RGB 并返回张量。
-    
+
+# 取第 index 个样本:走 Mosaic/MixUp 或 letterbox+透视,再做 HSV/翻转,最后转 CHW、BGR->RGB 并返回张量。    
     def __getitem__(self, index):
         """Fetches dataset item at `index` after applying indexing via `self.indices`, supporting
         linear/shuffled/image_weights modes.
@@ -812,7 +808,6 @@ class LoadImagesAndLabels(Dataset):
 # 校验单张图+标签对:修复损坏 JPEG、剔除非法坐标与重复行,返回规范化标签。
 
 # Ancillary functions --------------------------------------------------------------------------------------------------
-
 
 def verify_image_label(args):
     """Checks and verifies one image-label pair, fixing common issues and reporting anomalies."""

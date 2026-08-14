@@ -59,7 +59,6 @@ class Albumentations:
             im, labels = new["image"], np.array([[c, *b] for c, b in zip(new["class_labels"], new["bboxes"])])
         return im, labels
 
-
 # HSV 色彩空间随机增强(仅对 RGB 图有意义,多模态的深度/红外通道请勿使用)。
 def augment_hsv(im, hgain=0.5, sgain=0.5, vgain=0.5):
     """Applies HSV color-space augmentation with optional gains; expects BGR image input.
@@ -78,7 +77,6 @@ def augment_hsv(im, hgain=0.5, sgain=0.5, vgain=0.5):
 
         im_hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val)))
         cv2.cvtColor(im_hsv, cv2.COLOR_HSV2BGR, dst=im)  # no return needed
-
 
 # 直方图均衡化(可选 CLAHE),用于增强对比度。
 def hist_equalize(im, clahe=True, bgr=False):

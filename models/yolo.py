@@ -216,9 +216,8 @@ def check_anchor_order(m):
         LOGGER.info(f"{PREFIX}Reversing anchor order")
         m.anchors[:] = m.anchors.flip(0)
 
-
+"""YOLOv3 检测头：将特征图转换为预测，并在推理时生成网格与锚框网格用于解码。"""
 class Detect(nn.Module):
-    """YOLOv3 检测头：将特征图转换为预测，并在推理时生成网格与锚框网格用于解码。"""
 
     stride = None  # strides computed during build
     dynamic = False  # force grid reconstruction
@@ -274,9 +273,8 @@ class Detect(nn.Module):
         return grid, anchor_grid
 
 
+"""YOLOv3 模型基类：定义前向传播、层融合、摘要打印与设备迁移等通用能力。"""
 class BaseModel(nn.Module):
-    """YOLOv3 模型基类：定义前向传播、层融合、摘要打印与设备迁移等通用能力。"""
-
     def forward(self, x, profile=False, visualize=False):
         """Performs a single-scale inference or training step on input `x`（profile/visualize 为兼容保留参数）。"""
         return self._forward_once(x, profile, visualize)  # single-scale inference, train
@@ -318,9 +316,8 @@ class BaseModel(nn.Module):
         return self
 
 
+"""YOLOv3 检测模型：读取 yaml 配置构建网络，并初始化 stride、锚框与权重。"""
 class DetectionModel(BaseModel):
-    """YOLOv3 检测模型：读取 yaml 配置构建网络，并初始化 stride、锚框与权重。"""
-
     def __init__(self, cfg="yolov3-spp.yaml", ch=3, nc=None, anchors=None):  # model, input channels, number of classes
         """Initializes YOLOv3 detection model with configurable YAML, input channels, classes, and anchors."""
         super().__init__()
@@ -425,8 +422,7 @@ class DetectionModel(BaseModel):
 Model = DetectionModel  # retain YOLOv3 'Model' class for backwards compatibility
 
 
-def parse_model(d, ch):  # model_dict, input_channels(3)
-    """Parse a YOLOv3 model dict into an `nn.Sequential` module, scaling depth and width per the config.
+"""Parse a YOLOv3 model dict into an `nn.Sequential` module, scaling depth and width per the config.
 
     Args:
         d (dict): Model configuration with `backbone`/`head` layer lists plus `anchors`, `nc`, `depth_multiple`, and
@@ -437,6 +433,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         model (torch.nn.Sequential): Assembled model layers.
         save (list[int]): Sorted indices of layers whose outputs are retained for later use (skip connections).
     """
+def parse_model(d, ch):  # model_dict, input_channels(3)
     LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
     anchors, nc, gd, gw, act = d["anchors"], d["nc"], d["depth_multiple"], d["width_multiple"], d.get("activation")
     if act:
