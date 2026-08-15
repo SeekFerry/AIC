@@ -442,3 +442,46 @@ class MixConv2d(nn.Module):
     def forward(self, x):
         """Applies a series of convolutions, batch normalization, and SiLU activation to input tensor `x`."""
         return self.act(self.bn(torch.cat([m(x) for m in self.m], 1)))
+
+"""深度与红外特征融合（正交投影约束）"""
+class DepthIR_Fusion(nn.Module):
+    def __init__(self, c1, c2, hide_channel=8):
+        super().__init__()
+        self.conv_depth = Conv(c1, hide_channel, 1, 1)
+        self.conv_ir = Conv(c1, hide_channel, 1, 1)
+        self.conv_out = Conv(hide_channel * 2, c2, 1, 1)
+        self.alpha = nn.Parameter(torch.tensor(0.5))
+        self.beta = nn.Parameter(torch.tensor(0.5))
+
+    def forward(self, depth_feat, ir_feat):
+        d = self.conv_depth(depth_feat)
+        i = self.conv_ir(ir_feat)
+
+        dot_di = torch.sum(d * i, dim=1, keepdim=True)
+        norm_i = torch.norm(i, p=2, dim=1, keepdim=True)
+        proj_d_on_i = (dot_di / (norm_i + 1e-6)) * i
+
+        dot_id = torch.sum(i * d, dim=1, keepdim=True)
+        norm_d = torch.norm(d, p=2, dim=1, keepdim=True)
+        proj_i_on_d = (dot_id / (norm_d + 1e-6)) * d
+
+        alpha = torch.sigmoid(self.alpha)
+        beta = torch.sigmoid(self.beta)
+        d_orth = d - alpha * proj_d_on_i
+        i_orth = i - beta * proj_i_on_d
+
+        fused = torch.cat([d_orth, i_orth], dim=1)
+        return self.conv_out(fused)
+
+
+class MultiModalFusion(nn.Module):
+    """三模态融合：RGB + 深度 + 红外"""
+    def __init__(self, c1, c2, hide_channel=8):
+        super().__init__()
+        self.depthir_fusion = DepthIR_Fusion(c1, c1, hide_channel)
+        self.final_conv = Conv(c1 * 2, c2, 1, 1)
+
+    def forward(self, rgb_feat, depth_feat, ir_feat):
+        fused_di = self.depthir_fusion(depth_feat, ir_feat)
+        fused = torch.cat([rgb_feat, fused_di], dim=1)
+        return self.final_conv(fused)

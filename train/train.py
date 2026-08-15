@@ -167,7 +167,21 @@ def train(hyp, opt, device, callbacks):
     else:
         model = Model(cfg, ch=ch, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
     amp = check_amp(model)  # check AMP
+    """参考：
+    原代码（单流模型）
+    model = Model(cfg or ckpt["model"].yaml, ch=ch, nc=nc, anchors=hyp.get("anchors")).to(device)
 
+    替换为（三流模型）
+    from models import MultiModalDetectionModel
+    model = MultiModalDetectionModel(
+        cfg=cfg or ckpt["model"].yaml, 
+        ch=(3, 3, 3),           
+        nc=nc, 
+        anchors=hyp.get("anchors")
+    ).to(device)
+    |——要考虑是否加载预训练权重（预训练权重通常是单流模型的权重，三流模型可能需要自定义加载方式）
+    |——我的想法是主要加载RGB权重？
+    """
     # Freeze
     freeze = [f"model.{x}." for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
     for k, v in model.named_parameters():
@@ -328,14 +342,19 @@ def train(hyp, opt, device, callbacks):
             ni = i + nb * epoch  # number integrated batches (since train start)
             if num_modalities > 1:
                 im_vis, im_ir, im_dep, targets, paths, _ = batch
-                # 三模态早融合:通道维拼接后交给单骨干网络;若要换成其他融合结构,在此处修改。
-                imgs = torch.cat((im_vis, im_ir, im_dep), dim=1)
-                imgs_disp = im_vis  # 可视化/回调用可见光图
+                # 三模态独立输入，分别送进网络
+                im_vis = im_vis.to(device, non_blocking=True).float() / 255
+                im_ir = im_ir.to(device, non_blocking=True).float() / 255
+                im_dep = im_dep.to(device, non_blocking=True).float() / 255
+                imgs_disp = im_vis  # 可视化用可见光图
+                targets = targets.to(device)
+                pred = model(im_vis, im_ir, im_dep)
             else:
                 imgs, targets, paths, _ = batch
-                imgs_disp = imgs
-            imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
-
+                imgs = imgs.to(device, non_blocking=True).float() / 255
+                targets = targets.to(device)
+                pred = model(imgs)
+                
             # Warmup
             if ni <= nw:
                 xi = [0, nw]  # x interp
