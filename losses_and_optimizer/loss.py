@@ -80,6 +80,55 @@ def smooth_bce(eps: float = 0.1) -> tuple[float, float]:
     return 1.0 - 0.5 * eps, 0.5 * eps
 
 
+# DSSM 框损失:针对微小目标,综合"中心距离 + 宽高差 + 形状差"并按外接框对角线归一化,
+# 用于弥补传统 IoU 对微小目标位置偏移过于敏感的问题。
+def dssm_box_loss(
+    pred_boxes: torch.Tensor,
+    target_boxes: torch.Tensor,
+    alpha: float = 1.0,
+    K: float = 1.0,
+    eps: float = 1e-7,
+) -> torch.Tensor:
+    """Compute DSSM box loss for tiny objects.
+
+    Args:
+        pred_boxes (Tensor): (n, 4) predicted boxes in (x, y, w, h) center format.
+        target_boxes (Tensor): (n, 4) target boxes in (x, y, w, h) center format.
+        alpha (float): weight of the shape (aspect-ratio) difference term.
+        K (float): exponential balancing constant for the composite distance.
+
+    Returns:
+        Tensor: (n, 1) per-box scalar losses in [0, 1).
+    """
+    px, py, pw, ph = pred_boxes.chunk(4, -1)
+    tx, ty, tw, th = target_boxes.chunk(4, -1)
+
+    # 1. 中心点距离平方
+    d2_center = (px - tx).pow(2) + (py - ty).pow(2)
+
+    # 2. 宽高差异平方
+    d2_wh = (pw - tw).pow(2) + (ph - th).pow(2)
+
+    # 3. 形状差异:宽高向量的余弦相似度 -> 角度损失
+    r_cosine = (pw * tw + ph * th) / (
+        torch.sqrt(pw.pow(2) + ph.pow(2)) * torch.sqrt(tw.pow(2) + th.pow(2)) + eps
+    )
+    d_angle = alpha * (1.0 - r_cosine)
+
+    # 4. 外接矩形对角线平方(归一化因子)
+    d2_diag = (
+        torch.max(px + pw / 2, tx + tw / 2) - torch.min(px - pw / 2, tx - tw / 2)
+    ).pow(2) + (
+        torch.max(py + ph / 2, ty + th / 2) - torch.min(py - ph / 2, ty - th / 2)
+    ).pow(2) + eps
+
+    # 5. 组合距离度量(越小表示框越匹配)
+    r_composite = (d2_center + d2_wh + d_angle.pow(2)) / d2_diag
+
+    # 6. 论文相似度得分 e^{-K·R} ∈ (0, 1];损失取其补,与 1-IoU 同方向(匹配越好损失越小)
+    return 1.0 - torch.exp(-K * r_composite)
+
+
 # 判断模型是否使用了 DataParallel/DistributedDataParallel 多卡封装(用于 de_parallel 前处理)
 def is_parallel(model):
     """Checks if a model is using DataParallel (DP) or DistributedDataParallel (DDP)."""
@@ -215,6 +264,8 @@ class ComputeLoss:
         self.nl = m.nl  # number of layers
         self.anchors = m.anchors
         self.device = device
+        # 归一化面积占比阈值: 目标 w*h < 该值(1920x1080 下即面积 < 0.2% 整图)判为 tiny object
+        self.tiny_area_ratio = h.get("tiny_area_ratio", 0.002)
 
     # 前向计算:输入预测 p 与标签 targets,返回总损失与 (lbox, lobj, lcls) 分项损失
     def __call__(self, p, targets):  # predictions, targets
@@ -222,7 +273,7 @@ class ComputeLoss:
         lcls = torch.zeros(1, device=self.device)  # class loss
         lbox = torch.zeros(1, device=self.device)  # box loss
         lobj = torch.zeros(1, device=self.device)  # object loss
-        tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
+        tcls, tbox, indices, anchors, tiny_flags = self.build_targets(p, targets)  # targets
 
         # Losses
         for i, pi in enumerate(p):  # layer index, layer predictions
@@ -237,8 +288,18 @@ class ComputeLoss:
                 pxy = pxy.sigmoid() * 2 - 0.5
                 pwh = (pwh.sigmoid() * 2) ** 2 * anchors[i]
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
-                iou = bbox_iou(pbox, tbox[i], CIoU=True).squeeze()  # iou(prediction, target)
-                lbox += (1.0 - iou).mean()  # iou loss
+                iou = bbox_iou(pbox, tbox[i], CIoU=True).squeeze()  # iou(prediction, target), 仍用于 objectness
+                tiny_i = tiny_flags[i]  # (n,) bool: 该目标是否为 tiny object
+                if tiny_i.any():
+                    # 非 tiny 目标沿用原 CIoU 损失;tiny 目标改用 DSSM 框损失
+                    box_loss = torch.zeros_like(iou)
+                    nt_mask = ~tiny_i
+                    if nt_mask.any():
+                        box_loss[nt_mask] = 1.0 - iou[nt_mask]
+                    box_loss[tiny_i] = dssm_box_loss(pbox[tiny_i], tbox[i][tiny_i]).squeeze()
+                    lbox += box_loss.mean()
+                else:
+                    lbox += (1.0 - iou).mean()  # iou loss
 
                 # Objectness
                 iou = iou.detach().clamp(0).type(tobj.dtype)
@@ -271,12 +332,15 @@ class ComputeLoss:
 
     # 将 targets(image, class, x, y, w, h) 按层匹配到锚框,返回分类/框/索引/锚框
     def build_targets(self, p, targets):
-        """Match `targets` (image, class, x, y, w, h) to anchors per layer, returning tcls, tbox, indices, and anchors."""
+        """Match `targets` (image, class, x, y, w, h) to anchors per layer, returning tcls, tbox, indices, anchors, tiny_flags."""
         na, nt = self.na, targets.shape[0]  # number of anchors, targets
-        tcls, tbox, indices, anch = [], [], [], []
-        gain = torch.ones(7, device=self.device)  # normalized to gridspace gain
+        tcls, tbox, indices, anch, tiny_flags = [], [], [], [], []
+        gain = torch.ones(8, device=self.device)  # normalized to gridspace gain(多一列 tiny 标志,不参与缩放)
         ai = torch.arange(na, device=self.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
-        targets = torch.cat((targets.repeat(na, 1, 1), ai[..., None]), 2)  # append anchor indices
+        # tiny object 标志:归一化框面积占比 w*h < 阈值(1920x1080 下即面积 < 0.2% 整图)
+        tiny = (targets[:, 3] * targets[:, 4]) < self.tiny_area_ratio  # (nt,)
+        tiny = tiny.float().view(1, nt, 1).repeat(na, 1, 1)  # (na, nt, 1)
+        targets = torch.cat((targets.repeat(na, 1, 1), ai[..., None], tiny), 2)  # append anchor indices + tiny flag
 
         g = 0.5  # bias
         off = (
@@ -320,8 +384,10 @@ class ComputeLoss:
                 offsets = 0
 
             # Define
-            bc, gxy, gwh, a = t.chunk(4, 1)  # (image, class), grid xy, grid wh, anchors
+            bc, gxy, gwh, at = t.chunk(4, 1)  # (image, class), grid xy, grid wh, (anchors, tiny)
+            a, tiny_i = at[:, 0], at[:, 1]  # anchors, tiny flag
             a, (b, c) = a.long().view(-1), bc.long().T  # anchors, image, class
+            tiny_i = tiny_i.bool()
             gij = (gxy - offsets).long()
             gi, gj = gij.T  # grid indices
 
@@ -330,5 +396,6 @@ class ComputeLoss:
             tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
             anch.append(anchors[a])  # anchors
             tcls.append(c)  # class
+            tiny_flags.append(tiny_i)  # tiny object 标志
 
-        return tcls, tbox, indices, anch
+        return tcls, tbox, indices, anch, tiny_flags
