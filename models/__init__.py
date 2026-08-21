@@ -28,5 +28,6 @@ from .yolo import (  # noqa: F401
     Detect,
     DetectionModel,
     Model,
+    MultiModalDetectionModel,
     parse_model,
 )

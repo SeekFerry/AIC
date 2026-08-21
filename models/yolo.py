@@ -39,6 +39,7 @@ from .common import (
     MixConv2d,
     SPP,
     SPPF,
+    MultiModalFusion,
 )
 
 # -----------------------------------------------------------------------------------
@@ -505,3 +506,186 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             ch = []
         ch.append(c2)
     return nn.Sequential(*layers), sorted(save)
+
+class MultiModalBackbone(nn.Module):
+    """
+    三流共享权重的骨干网络
+    三个模态使用相同的 backbone 结构，但不共享权重（各自独立）
+    """
+    def __init__(self, cfg, ch=(3, 3, 3)):
+        super().__init__()
+        self.num_modalities = len(ch)
+        
+        # 为每个模态创建独立的 backbone
+        self.backbones = nn.ModuleList()
+        for c in ch:
+            model = DetectionModel(cfg=cfg, ch=c)
+            self.backbones.append(model)
+        
+        # 记录每个模态输出的特征图索引（需要根据 YAML 调整）
+        self.p3_idx = 6
+        self.p4_idx = 8
+        self.p5_idx = 10
+    
+    def forward(self, x_rgb, x_depth, x_ir):
+        """
+        输入：三个模态的图像 [B, 3, H, W]
+        输出：三个模态的 P3, P4, P5 特征图
+        """
+        outs_rgb = []
+        outs_depth = []
+        outs_ir = []
+        
+        for i, (x, backbone) in enumerate(zip([x_rgb, x_depth, x_ir], self.backbones)):
+            y = []
+            x_i = x
+            for m in backbone.model:
+                if m.f != -1:
+                    x_i = y[m.f] if isinstance(m.f, int) else [x_i if j == -1 else y[j] for j in m.f]
+                x_i = m(x_i)
+                y.append(x_i if m.i in backbone.save else None)
+            
+            p3 = y[self.p3_idx]
+            p4 = y[self.p4_idx]
+            p5 = y[self.p5_idx]
+            
+            if i == 0:   # RGB
+                outs_rgb.extend([p3, p4, p5])
+            elif i == 1: # Depth
+                outs_depth.extend([p3, p4, p5])
+            elif i == 2: # IR
+                outs_ir.extend([p3, p4, p5])
+        
+        # 返回三个模态的特征图，格式为 [模态数][尺度数]
+        return {
+            'rgb': [outs_rgb[0], outs_rgb[1], outs_rgb[2]],
+            'depth': [outs_depth[0], outs_depth[1], outs_depth[2]],
+            'ir': [outs_ir[0], outs_ir[1], outs_ir[2]],
+        }
+
+
+class MultiModalDetectionModel(BaseModel):
+    """
+    三模态检测模型：三条独立流 → 融合 → 检测头
+    """
+    def __init__(self, cfg='yolov3-spp.yaml', ch=(3, 3, 3), nc=None, anchors=None):
+        super().__init__()
+        self.num_modalities = len(ch)
+        self.names = [str(i) for i in range(nc)] if nc else []
+        
+        import yaml
+        with open(cfg, 'r') as f:
+            self.yaml = yaml.safe_load(f)
+        
+        # 构建三个独立 backbone
+        self.backbones = nn.ModuleList()
+        for c in ch:
+            temp_cfg = deepcopy(self.yaml)
+            temp_cfg['ch'] = c
+            temp_model, save = parse_model(
+                {'backbone': temp_cfg['backbone'],
+                 'head': temp_cfg['head'], 
+                 'nc': temp_cfg['nc'], 
+                 'depth_multiple': temp_cfg['depth_multiple'], 
+                 'width_multiple': temp_cfg['width_multiple'],
+                 'anchors': temp_cfg['anchors']}, 
+                ch=[c]
+            )
+            backbone_layers = nn.Sequential(*[temp_model[i] for i in range(11)])
+            backbone_wrapper = BaseModel()
+            backbone_wrapper.model = backbone_layers
+            backbone_wrapper.save = save
+            self.backbones.append(backbone_wrapper)
+            del temp_model
+        
+        # 定义融合模块（在 P3, P4, P5 三个尺度分别融合）
+        self.fusion_p3 = MultiModalFusion(c1=256, c2=256, hide_channel=8)
+        self.fusion_p4 = MultiModalFusion(c1=512, c2=512, hide_channel=8)
+        self.fusion_p5 = MultiModalFusion(c1=1024, c2=1024, hide_channel=8)
+        
+        # 构建 head（从 YAML 中解析 head 部分）
+                
+        full_model, full_save = parse_model(
+            {
+                'backbone': self.yaml['backbone'],
+                'head': self.yaml['head'],
+                'nc': self.yaml['nc'],
+                'depth_multiple': self.yaml['depth_multiple'],
+                'width_multiple': self.yaml['width_multiple'],
+                'anchors': self.yaml['anchors']
+            },
+            ch=[3]  # 单流输入，只是为了解析 head 结构
+        )
+                
+        head_layers = []
+        for i in range(11, len(full_model)):
+            m = full_model[i]
+            # 修改 m.f 适配输入
+            if m.f != -1:
+                if isinstance(m.f, int):
+                    if m.f in [6, 8, 10]:  # P3, P4, P5
+                        m.f = [0, 1, 2][[6, 8, 10].index(m.f)]
+                elif isinstance(m.f, list):
+                    new_f = []
+                    for f in m.f:
+                        if f in [6, 8, 10]:
+                            new_f.append([0, 1, 2][[6, 8, 10].index(f)])
+                        elif f == -1:
+                            new_f.append(-1)
+                        else:
+                            new_f.append(f)
+                    m.f = new_f
+            head_layers.append(m)
+
+        self.head = nn.ModuleList(head_layers)
+        
+        # 初始化检测头
+        m = self.head[-1]
+        if isinstance(m, Detect):
+            s = 256
+            dummy = torch.zeros(1, 3, s, s)
+            m.stride = torch.tensor([s / x.shape[-2] for x in self._forward_dummy(dummy)])
+            m.anchors /= m.stride.view(-1, 1, 1)
+            check_anchor_order(m)
+            self.stride = m.stride
+
+    def _forward_dummy(self, x):
+        return self.forward(x, x, x)
+    
+    def forward(self, x_rgb, x_depth, x_ir, augment=False, profile=False, visualize=False):
+        """
+        输入：三个模态的图像
+        """
+        # 1. 分别通过三个 backbone
+        feat_rgb = self._forward_backbone(self.backbones[0], x_rgb)
+        feat_depth = self._forward_backbone(self.backbones[1], x_depth)
+        feat_ir = self._forward_backbone(self.backbones[2], x_ir)
+        
+        # 分别融合
+        p3_fused = self.fusion_p3(feat_rgb[0], feat_depth[0], feat_ir[0])
+        p4_fused = self.fusion_p4(feat_rgb[1], feat_depth[1], feat_ir[1])
+        p5_fused = self.fusion_p5(feat_rgb[2], feat_depth[2], feat_ir[2])
+        
+        x = [p3_fused, p4_fused, p5_fused]
+        for m in self.head:
+            if m.f != -1:
+                if isinstance(m.f, int):
+                    x = [x[m.f]]
+                else:
+                    x = [x[j] if isinstance(j, int) else [x[k] for k in j] for j in m.f]
+            x = m(x)
+        
+        return x
+    
+    def _forward_backbone(self, backbone, x):
+        """获取 backbone 的三个尺度输出"""
+        y = []
+        for m in backbone.model:
+            if m.f != -1:
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+            x = m(x)
+            y.append(x if m.i in backbone.save else None)
+        
+        # 需要根据实际 YAML 调整这些索引
+        p3_idx, p4_idx, p5_idx = 6, 8, 10 
+        return [y[p3_idx], y[p4_idx], y[p5_idx]]
