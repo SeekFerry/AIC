@@ -5,14 +5,15 @@
 数据加载 -> data
 模型构建 -> models
 损失/优化 -> losses&optimizer
-辅助工具 -> train11111new/utils
+辅助工具 -> train/utils
 
 用法(单卡训练,推荐):
-    $ python train11111new/train.py --data data/coco128.yaml --weights yolov3-tiny.pt --imgsz 640
-    $ python train11111new/train.py --data data/coco128.yaml --weights '' --cfg models11111new/yolov3-spp.yaml --imgsz 640  # 从零训练
+    $ python train/train.py                                    # 直接用默认配置训练三模态数据集
+    $ python train/train.py --device 0 --batch-size 8          # 指定 GPU 与批大小
+    $ python train/train.py --weights yolov3-tiny.pt           # 从预训练权重微调
 
 用法(多卡 DDP):
-    $ python -m torch.distributed.run --nproc_per_node 4 --master_port 1 train11111new/train.py --data data/coco128.yaml --weights yolov3-tiny.pt --imgsz 640 --device 0,1,2,3
+    $ python -m torch.distributed.run --nproc_per_node 4 --master_port 1 train/train.py --data data/coco128.yaml --weights yolov3-tiny.pt --imgsz 640 --device 0,1,2,3
 """
 
 import argparse
@@ -342,18 +343,17 @@ def train(hyp, opt, device, callbacks):
             ni = i + nb * epoch  # number integrated batches (since train start)
             if num_modalities > 1:
                 im_vis, im_ir, im_dep, targets, paths, _ = batch
-                # 三模态独立输入，分别送进网络
                 im_vis = im_vis.to(device, non_blocking=True).float() / 255
                 im_ir = im_ir.to(device, non_blocking=True).float() / 255
                 im_dep = im_dep.to(device, non_blocking=True).float() / 255
+                imgs = torch.cat((im_vis, im_ir, im_dep), dim=1)  # 三模态早融合:通道维拼接
                 imgs_disp = im_vis  # 可视化用可见光图
                 targets = targets.to(device)
-                pred = model(im_vis, im_ir, im_dep)
             else:
                 imgs, targets, paths, _ = batch
                 imgs = imgs.to(device, non_blocking=True).float() / 255
+                imgs_disp = imgs
                 targets = targets.to(device)
-                pred = model(imgs)
                 
             # Warmup
             if ni <= nw:
@@ -508,11 +508,11 @@ def train(hyp, opt, device, callbacks):
 def parse_opt(known=False):
     """Parse command line arguments for configuring the training of a YOLOv3 model."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--weights", type=str, default=REPO_ROOT / "yolov3-tiny.pt", help="initial weights path")
-    parser.add_argument("--cfg", type=str, default="", help="model.yaml path")
-    parser.add_argument("--data", type=str, default=REPO_ROOT / "data/coco128.yaml", help="dataset.yaml path")
+    parser.add_argument("--weights", type=str, default="", help="initial weights path (empty = train from scratch)")
+    parser.add_argument("--cfg", type=str, default=REPO_ROOT / "models/yolov3-spp.yaml", help="model.yaml path")
+    parser.add_argument("--data", type=str, default=REPO_ROOT / "data/tri.yaml", help="dataset.yaml path")
     parser.add_argument(
-        "--hyp", type=str, default=REPO_ROOT / "data11111new/hyps/hyp.scratch-low.yaml", help="hyperparameters path"
+        "--hyp", type=str, default=REPO_ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path"
     )
     parser.add_argument("--epochs", type=int, default=100, help="total training epochs")
     parser.add_argument("--batch-size", type=int, default=16, help="total batch size for all GPUs, -1 for autobatch")

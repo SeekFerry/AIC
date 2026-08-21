@@ -38,7 +38,7 @@ def attempt_load(weights, device=None, inplace=True, fuse=True):
     Returns:
         (torch.nn.Module): The loaded model, or an `Ensemble` if multiple weights are provided.
     """
-    from models11111new import Detect, Model
+    from models import Detect, Model
 
     model = Ensemble()
     for w in weights if isinstance(weights, list) else [weights]:

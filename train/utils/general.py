@@ -314,10 +314,16 @@ def check_amp(model):
 
     prefix = colorstr("AMP: ")
     f = ROOT / "data" / "images" / "bus.jpg"  # image to check
-    im = torch.zeros((1, 3, 640, 640), device=device)  # fallback dummy image
+    # 输入通道数需与模型一致(三模态早融合为 9 通道)
+    in_ch = 3
+    for m in model.modules():
+        if isinstance(m, torch.nn.Conv2d):
+            in_ch = m.in_channels
+            break
+    im = torch.zeros((1, in_ch, 640, 640), device=device)  # fallback dummy image
     if f.exists():
         try:
-            from data11111new import LoadImages
+            from data import LoadImages
 
             sample = next(iter(LoadImages(f, img_size=640, stride=32)))
             im = torch.from_numpy(sample[1]).float().unsqueeze(0).to(device)

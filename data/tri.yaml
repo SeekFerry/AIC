@@ -3,11 +3,14 @@
 
 # 数据集根目录(内含 visible/ infrared/ depth/ labels 四个文件夹)
 # 请改成你的真实数据集根目录,例如 D:/dataset/tri 或绝对路径
-path: sample
+path: D:/pytorch/AIC_sample
 
 # 训练集 / 验证集根目录(相对 path,此处都指向根目录;如有单独验证集请单独填写)
 train: .
 val: .
+
+# 测试集根目录(拿到测试集后填写;内含 visible/ infrared/ depth 三个文件夹,无 labels)
+test: D:/pytorch/AIC_sample_test
 
 # 类别数量与名称(从 0 开始编号)
 nc: 12
