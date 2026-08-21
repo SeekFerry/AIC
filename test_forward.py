@@ -5,7 +5,7 @@ from models.yolo import MultiModalDetectionModel  # 新添加的类
 model = MultiModalDetectionModel(
     cfg='models/yolov3-spp.yaml',
     ch=(3, 3, 3),
-    nc=80
+    nc=12
 )
 
 # 2. 创建随机输入 (模拟三个模态的batch)

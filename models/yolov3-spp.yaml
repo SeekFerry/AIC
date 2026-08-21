@@ -6,7 +6,7 @@
 # Example usage: python train.py --cfg yolov3-spp.yaml --data coco.yaml
 
 # Parameters
-nc: 80 # number of classes
+nc: 12 # number of classes (0: person, 1: boat, 2: animal, 3: seat, 4: sign, 5: bicycle, 6: car, 7: ball, 8: light, 9: garbage can, 10: uav, 11: tricycle)
 depth_multiple: 1.0 # model depth multiple
 width_multiple: 1.0 # layer channel multiple
 anchors:

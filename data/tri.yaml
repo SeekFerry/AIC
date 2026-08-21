@@ -1,0 +1,26 @@
+# 三模态检测比赛数据集配置
+# 训练命令示例: python train/train.py --data data/tri.yaml --cfg models/yolov3-spp.yaml --weights '' --imgsz 640
+
+# 数据集根目录(内含 visible/ infrared/ depth/ labels 四个文件夹)
+# 请改成你的真实数据集根目录,例如 D:/dataset/tri 或绝对路径
+path: sample
+
+# 训练集 / 验证集根目录(相对 path,此处都指向根目录;如有单独验证集请单独填写)
+train: .
+val: .
+
+# 类别数量与名称(从 0 开始编号)
+nc: 12
+names:
+  0: person
+  1: boat
+  2: animal
+  3: seat
+  4: sign
+  5: bicycle
+  6: car
+  7: ball
+  8: light
+  9: garbage can
+  10: uav
+  11: tricycle
