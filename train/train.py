@@ -48,7 +48,7 @@ from ultralytics.utils.torch_utils import TORCH_2_4, autocast
 import val as validate  # 每个 epoch 结束后计算 mAP
 from data import create_dataloader, dataset_num_modalities
 from losses_and_optimizer import ComputeLoss, smart_optimizer
-from models import Model
+from models import Model, MultiModalDetectionModel
 from utils.autoanchor import check_anchors
 from utils.autobatch import check_train_batch_size
 from utils.callbacks import Callbacks
@@ -155,19 +155,50 @@ def train(hyp, opt, device, callbacks):
     # Model
     check_suffix(weights, ".pt")  # check weights
     pretrained = weights.endswith(".pt")
+    multimodal = num_modalities == 3
     if pretrained:
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch_load(weights, map_location="cpu")  # load checkpoint to CPU to avoid CUDA memory leak
-        model = Model(cfg or ckpt["model"].yaml, ch=ch, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
-        exclude = ["anchor"] if (cfg or hyp.get("anchors")) and not resume else []  # exclude keys
+        model_cfg = cfg or ckpt["model"].yaml
+        model = (
+            MultiModalDetectionModel(model_cfg, ch=(3, 3, 3), nc=nc, anchors=hyp.get("anchors"))
+            if multimodal
+            else Model(model_cfg, ch=ch, nc=nc, anchors=hyp.get("anchors"))
+        ).to(device)
+        exclude = ["anchor"] if (cfg or hyp.get("anchors")) and not resume else []
         csd = ckpt["model"].float().state_dict()  # checkpoint state_dict as FP32
-        csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
+        if multimodal:
+            # Initialize every stream from the single-stream checkpoint where shapes match.
+            mapped = {}
+            for key, value in csd.items():
+                if key.startswith("backbones."):
+                    target_keys = [key]
+                elif key.startswith("model."):
+                    layer, _, suffix = key[6:].partition(".")
+                    if not layer.isdigit():
+                        continue
+                    layer_index = int(layer)
+                    target_keys = (
+                        [f"backbones.{stream}.model.{layer_index}.{suffix}" for stream in range(3)]
+                        if layer_index < 11
+                        else [f"model.{layer_index - 11}.{suffix}"]
+                    )
+                else:
+                    continue
+                for target_key in target_keys:
+                    mapped[target_key] = value
+            csd = mapped
+        csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)
         model.load_state_dict(csd, strict=False)  # load
         LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from {weights}")  # report
     else:
-        model = Model(cfg, ch=ch, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
-    amp = check_amp(model)  # check AMP
+        model = (
+            MultiModalDetectionModel(cfg, ch=(3, 3, 3), nc=nc, anchors=hyp.get("anchors"))
+            if multimodal
+            else Model(cfg, ch=ch, nc=nc, anchors=hyp.get("anchors"))
+        ).to(device)
+    amp = check_amp(model) if not multimodal else cuda
     """参考：
     原代码（单流模型）
     model = Model(cfg or ckpt["model"].yaml, ch=ch, nc=nc, anchors=hyp.get("anchors")).to(device)
@@ -184,7 +215,12 @@ def train(hyp, opt, device, callbacks):
     |——我的想法是主要加载RGB权重？
     """
     # Freeze
-    freeze = [f"model.{x}." for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
+    freeze_layers = freeze if len(freeze) > 1 else range(freeze[0])
+    freeze = (
+        [f"backbones.{stream}.model.{layer}." for stream in range(3) for layer in freeze_layers]
+        if multimodal
+        else [f"model.{layer}." for layer in freeze_layers]
+    )  # layers to freeze
     for k, v in model.named_parameters():
         v.requires_grad = True  # train all layers
         if any(x in k for x in freeze):
@@ -341,18 +377,20 @@ def train(hyp, opt, device, callbacks):
         for i, batch in pbar:  # batch -------------------------------------------------------------
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch  # number integrated batches (since train start)
-            if num_modalities > 1:
+            if multimodal:
                 im_vis, im_ir, im_dep, targets, paths, _ = batch
                 im_vis = im_vis.to(device, non_blocking=True).float() / 255
                 im_ir = im_ir.to(device, non_blocking=True).float() / 255
                 im_dep = im_dep.to(device, non_blocking=True).float() / 255
-                imgs = torch.cat((im_vis, im_ir, im_dep), dim=1)  # 三模态早融合:通道维拼接
                 imgs_disp = im_vis  # 可视化用可见光图
+                modal_imgs = (im_vis, im_ir, im_dep)
+                imgs = torch.cat(modal_imgs, dim=1)
                 targets = targets.to(device)
             else:
                 imgs, targets, paths, _ = batch
                 imgs = imgs.to(device, non_blocking=True).float() / 255
                 imgs_disp = imgs
+                modal_imgs = (imgs,)
                 targets = targets.to(device)
                 
             # Warmup
@@ -372,11 +410,15 @@ def train(hyp, opt, device, callbacks):
                 sf = sz / max(imgs.shape[2:])  # scale factor
                 if sf != 1:
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
-                    imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
+                    modal_imgs = tuple(
+                        nn.functional.interpolate(x, size=ns, mode="bilinear", align_corners=False)
+                        for x in modal_imgs
+                    )
+                    imgs = torch.cat(modal_imgs, dim=1) if multimodal else modal_imgs[0]
 
             # Forward
             with autocast(amp):
-                pred = model(imgs)  # forward
+                pred = model(*modal_imgs) if multimodal else model(imgs)  # forward
                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode

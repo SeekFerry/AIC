@@ -1,0 +1,20 @@
+# Core deep-learning runtime
+torch==2.4.1
+torchvision==0.19.1
+ultralytics>=8.2,<9
+
+# Dataset, augmentation, validation and plotting
+numpy>=1.24,<2.1
+opencv-python>=4.8
+Pillow>=10.0
+PyYAML>=6.0
+psutil>=5.9
+scipy>=1.10
+matplotlib>=3.7
+pandas>=2.0
+seaborn>=0.12
+tqdm>=4.65
+
+# Optional: model profiling and COCO JSON evaluation
+thop>=0.1.1
+pycocotools>=2.0.7

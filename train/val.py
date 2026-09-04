@@ -197,13 +197,6 @@ def run(
                 f"{weights} ({ncm} classes) trained on different --data than what you passed ({nc} "
                 f"classes). Pass correct combination of --weights and --data that are trained together."
             )
-        # warmup(纯 PyTorch 模型无 warmup 方法,空跑一次预热 CUDA)
-        in_ch = 3
-        for m in model.modules():
-            if isinstance(m, torch.nn.Conv2d):
-                in_ch = m.in_channels  # 三模态早融合模型为 9 通道
-                break
-        model(torch.zeros((1 if pt else batch_size, in_ch, imgsz, imgsz), device=device))
         pad, rect = (0.0, False) if task == "speed" else (0.5, pt)  # square inference for benchmarks
         task = task if task in ("train", "val", "test") else "val"  # path to train/val/test images
         dataloader = create_dataloader(
@@ -217,6 +210,15 @@ def run(
             workers=workers,
             prefix=colorstr(f"{task}: "),
         )[0]
+
+        # Warm up after creating the loader so the model receives the same modality layout as validation.
+        warmup_size = 1 if pt else batch_size
+        if getattr(model, "num_modalities", 1) == 3:
+            dummy = torch.zeros((warmup_size, 3, imgsz, imgsz), device=device)
+            model(dummy, dummy, dummy)
+        else:
+            in_ch = next((m.in_channels for m in model.modules() if isinstance(m, torch.nn.Conv2d)), 3)
+            model(torch.zeros((warmup_size, in_ch, imgsz, imgsz), device=device))
 
     seen = 0
     confusion_matrix = ConfusionMatrix(nc=nc)
@@ -236,22 +238,27 @@ def run(
         multimodal = len(batch) == 6
         if multimodal:
             im_vis, im_ir, im_dep, targets, paths, shapes = batch
-            im = torch.cat((im_vis, im_ir, im_dep), dim=1)  # 三模态早融合:通道维拼接
             im_plot = im_vis  # 可视化用可见光图
+            modal_ims = (im_vis, im_ir, im_dep)
         else:
             im, targets, paths, shapes = batch
             im_plot = im
+            modal_ims = (im,)
         with dt[0]:
             if cuda:
-                im = im.to(device, non_blocking=True)
+                modal_ims = tuple(x.to(device, non_blocking=True) for x in modal_ims)
                 targets = targets.to(device)
-            im = im.half() if half else im.float()  # uint8 to fp16/32
-            im /= 255  # 0 - 255 to 0.0 - 1.0
+            modal_ims = tuple((x.half() if half else x.float()) / 255 for x in modal_ims)
+            im = torch.cat(modal_ims, dim=1) if multimodal else modal_ims[0]
             nb, _, height, width = im.shape  # batch size, channels, height, width
 
         # Inference
         with dt[1]:
-            preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
+            if multimodal:
+                output = model(*modal_ims)
+            else:
+                output = model(im, augment=augment)
+            preds, train_out = output if compute_loss else (output, None)
 
         # Loss
         if compute_loss:
