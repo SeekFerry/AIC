@@ -678,12 +678,16 @@ class MultiModalDetectionModel(BaseModel):
     def _forward_backbone(self, backbone, x):
         """获取 backbone 的三个尺度输出"""
         y = []
+        features = {}
         for m in backbone.model:
             if m.f != -1:
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
             x = m(x)
+            if m.i in {6, 8, 10}:
+                features[m.i] = x
             y.append(x if m.i in backbone.save else None)
         
-        # 需要根据实际 YAML 调整这些索引
-        p3_idx, p4_idx, p5_idx = 6, 8, 10 
-        return [y[p3_idx], y[p4_idx], y[p5_idx]]
+        missing = {index for index in (6, 8, 10) if index not in features}
+        if missing:
+            raise RuntimeError(f"Backbone did not produce required P3/P4/P5 layers: {sorted(missing)}")
+        return [features[6], features[8], features[10]]
