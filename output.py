@@ -60,8 +60,8 @@ def dataset_test_path():
     p = Path(test)
     if p.is_absolute():
         return str(p)
-    base = Path(d.get("path") or ".")
-    return str(base / p)
+    # test 与 path 一样,都是相对代码根目录(REPO_ROOT)填写的,如 ../AIC2026_PHASE_1_1000
+    return str((REPO_ROOT / p).resolve())
 
 
 # 解析某个模态的实际目录,兼容 infared/infrared 的拼写差异。
