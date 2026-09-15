@@ -4,7 +4,9 @@
 
 功能:
   1. 读取测试集根目录(内含 visible / infrared(或 infared) / depth 三个模态文件夹,无 labels)。
-  2. 将三个模态沿通道维拼接(早融合),送入训练好的模型推理。
+  2. 自动识别模型类型:
+       - 三流模型 MultiModalDetectionModel -> 三个模态分开输入 model(visible, infrared, depth)
+       - 单流早融合模型(9 通道)          -> 三模态拼成 9 通道一次输入
   3. 每张图生成同名预测 TXT,每行格式:
          class_id norm_center_x norm_center_y norm_w norm_h confidence
      未检测到目标时生成空 TXT(不允许缺失)。
@@ -77,9 +79,29 @@ def resolve_modality_dir(root, name):
     return None
 
 
-# 读取并拼接三个模态,做 letterbox 后转为模型输入张量 (1, 9, H, W)。
+# 判断模型是否要求三个模态分别输入(三流 MultiModalDetectionModel)。
+# 单流模型(9 通道早融合)只需一个输入张量,三流模型需要 (visible, infrared, depth) 三个张量。
+def is_multi_stream(model):
+    """Return True if the model expects three separate modality tensors (three-stream model)."""
+    if hasattr(model, "backbones"):
+        return True
+    try:
+        import inspect
+
+        required = [
+            p
+            for p in inspect.signature(model.forward).parameters.values()
+            if p.default is inspect.Parameter.empty and p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        ]
+        return len(required) > 1
+    except Exception:
+        return False
+
+
+# 读取三个模态 -> 共享同一套 letterbox -> 各自转成 (1,3,H,W) 张量。
+# 返回: [visible, infrared, depth] 三个张量, 原图尺寸 (h0, w0), letterbox 参数 (ratio, pad)
 def load_multimodal_tensor(files, imgsz, stride):
-    """Load visible/infrared/depth images, concat along channel, letterbox, and convert to a model tensor."""
+    """Load visible/infrared/depth images with one shared letterbox and return per-modality tensors."""
     ims = []
     h0 = w0 = None
     for f in files:
@@ -88,13 +110,16 @@ def load_multimodal_tensor(files, imgsz, stride):
         if h0 is None:
             h0, w0 = im.shape[:2]
         ims.append(im)
-    im = np.concatenate(ims, axis=2)  # HxWx(3*num_modalities)
+    im = np.concatenate(ims, axis=2)  # HxWx(3*num_modalities),三模态共享同一套几何变换
     im, ratio, pad = letterbox(im, imgsz, stride=stride, auto=False)
 
-    # 拆成三个模态,分别 HWC->CHW 且 BGR->RGB,再沿通道维拼接成 (9, H, W)。
+    # 拆回三个模态,各自 HWC->CHW 且 BGR->RGB
     mods = np.split(im, len(ims), axis=2)
-    chw = np.concatenate([np.ascontiguousarray(m.transpose(2, 0, 1)[::-1]) for m in mods], axis=0)
-    return torch.from_numpy(chw).float().unsqueeze(0) / 255, (h0, w0), (ratio, pad)
+    tensors = [
+        torch.from_numpy(np.ascontiguousarray(m.transpose(2, 0, 1)[::-1])).float().unsqueeze(0) / 255
+        for m in mods
+    ]
+    return tensors, (h0, w0), (ratio, pad)
 
 
 # 将一张图的检测结果按比赛格式写入 TXT(未检测到则写入空文件)。
@@ -157,22 +182,30 @@ def run(
     assert vis_files, f"No images found in {vis_dir}"
     LOGGER.info(f"Found {len(vis_files)} test images in {root}")
 
+    multi_stream = is_multi_stream(model)  # True: 三流模型(分开输入) / False: 9 通道早融合
+    LOGGER.info(f"Model type: {'three-stream (visible/infrared/depth)' if multi_stream else 'single-stream (9-channel early fusion)'}")
+
     for vis_f in TQDM(vis_files, desc="Predicting"):
         rel = vis_f.relative_to(vis_dir)
         files = [vis_f, ir_dir / rel, dep_dir / rel]
         for f in files[1:]:
             assert f.is_file(), f"Missing paired image {f}"
 
-        im, (h0, w0), ratio_pad = load_multimodal_tensor(files, imgsz, stride)
-        im = im.to(device, non_blocking=True)
-        im = im.half() if half else im.float()
+        tensors, (h0, w0), ratio_pad = load_multimodal_tensor(files, imgsz, stride)
+        tensors = [t.to(device, non_blocking=True) for t in tensors]
+        tensors = [t.half() if half else t.float() for t in tensors]
 
-        pred = model(im)[0]
+        with torch.no_grad():
+            if multi_stream:
+                # 顺序必须与训练一致:model(visible, infrared, depth)
+                pred = model(tensors[0], tensors[1], tensors[2])[0]
+            else:
+                pred = model(torch.cat(tensors, dim=1))[0]
         pred = non_max_suppression(pred, conf_thres, iou_thres, max_det=max_det)[0]
 
         # 预测框从推理尺寸映射回原图(像素坐标 xyxy)
         predn = pred.clone()
-        scale_boxes(im.shape[2:], predn[:, :4], (h0, w0), ratio_pad=ratio_pad)
+        scale_boxes(tensors[0].shape[2:], predn[:, :4], (h0, w0), ratio_pad=ratio_pad)
 
         save_one_txt(predn, h0, w0, labels_dir / f"{vis_f.stem}.txt")
 
