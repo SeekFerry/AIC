@@ -5,12 +5,14 @@
 # 请改成你的真实数据集根目录,例如 D:/dataset/tri 或绝对路径
 path: ../AIC2026_Train_2000
 
-# 训练集 / 验证集根目录(相对 path,此处都指向根目录;如有单独验证集请单独填写)
+# 保留 train/val 同指向原始根目录,兼容原训练命令。
+# 训练入口会检测该情形,自动生成固定 seed=42 的 85/15 样本级拆分到 train/ 和 val/。
+# 若提供了独立划分,可将 train/val 分别改为对应目录;测试集不会参与拆分。
 train: .
 val: .
 
 # 测试集根目录(拿到测试集后填写;内含 visible/ infrared/ depth 三个文件夹,无 labels)
-test: ../AIC2026_PHASE_1_1000
+test: ../AIC2026_PHASE_2
 
 # 类别数量与名称(从 0 开始编号)
 nc: 12

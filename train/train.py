@@ -145,6 +145,31 @@ def train(hyp, opt, device, callbacks):
     with torch_distributed_zero_first(LOCAL_RANK):
         data_dict = check_dataset(data)  # check if None
     train_path, val_path = data_dict["train"], data_dict["val"]
+    if isinstance(train_path, str) and isinstance(val_path, str):
+        train_root = Path(train_path).resolve()
+        val_root = Path(val_path).resolve()
+        if train_root == val_root:
+            if dataset_num_modalities(str(train_root)) != 3:
+                raise ValueError(
+                    f"Training and validation point to the same directory ({train_root}). "
+                    "Use separate splits; automatic splitting is only supported for tri-modal datasets."
+                )
+            from data.split_dataset import split_dataset
+
+            split_stats = None
+            with torch_distributed_zero_first(LOCAL_RANK):
+                if RANK in {-1, 0}:
+                    split_stats = split_dataset(train_root, val_ratio=0.15, seed=42)
+            train_path, val_path = str(train_root / "train"), str(train_root / "val")
+            data_dict["train"], data_dict["val"] = train_path, val_path
+            if split_stats is not None:
+                _, _, train_count, val_count = split_stats
+                LOGGER.info(
+                    "Train/val directories were identical; created deterministic 85/15 sample split "
+                    "(seed=42): %d train, %d val",
+                    train_count,
+                    val_count,
+                )
     nc = 1 if single_cls else int(data_dict["nc"])  # number of classes
     names = {0: "item"} if single_cls and len(data_dict["names"]) != 1 else data_dict["names"]  # class names
     is_coco = isinstance(val_path, str) and val_path.endswith("coco/val2017.txt")  # COCO dataset
