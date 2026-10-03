@@ -93,6 +93,157 @@ WORLD_SIZE = int(os.getenv("WORLD_SIZE", "1"))
 GIT_INFO = check_git_info()
 
 
+def _state_dict_from_checkpoint(checkpoint):
+    """Extract tensor weights from common YOLO/PyTorch checkpoint layouts."""
+    candidates = ("model", "ema", "state_dict", "model_state_dict", "weights")
+    if isinstance(checkpoint, nn.Module):
+        return checkpoint.state_dict(), "module"
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f"Unsupported checkpoint type: {type(checkpoint).__name__}")
+
+    for name in candidates:
+        value = checkpoint.get(name)
+        if isinstance(value, nn.Module):
+            return value.state_dict(), name
+        if isinstance(value, dict):
+            for nested_name in ("state_dict", "model_state_dict"):
+                nested = value.get(nested_name)
+                if isinstance(nested, dict):
+                    tensor_state = {key: tensor for key, tensor in nested.items() if torch.is_tensor(tensor)}
+                    if tensor_state:
+                        return tensor_state, f"{name}.{nested_name}"
+            tensor_state = {key: tensor for key, tensor in value.items() if torch.is_tensor(tensor)}
+            if tensor_state:
+                return tensor_state, name
+
+    tensor_state = {key: tensor for key, tensor in checkpoint.items() if torch.is_tensor(tensor)}
+    if tensor_state:
+        return tensor_state, "root state_dict"
+    raise ValueError(f"No model tensors found in checkpoint fields: {sorted(checkpoint)}")
+
+
+def _yolo_layer_key(key):
+    """Return (layer index, layer-local key) for common YOLO state-dict key prefixes."""
+    while key.startswith("module."):
+        key = key[len("module.") :]
+    if key.startswith("model.model."):
+        key = key[len("model.") :]
+    if key.startswith("model."):
+        key = key[len("model.") :]
+    layer, separator, suffix = key.partition(".")
+    if not separator or not layer.isdigit():
+        return None
+    return int(layer), suffix
+
+
+def _load_single_yolo_backbone(checkpoint_state, model, weights, source_field):
+    """Copy matching single-stream YOLO backbone tensors into three independent branches."""
+    backbone_layers = len(model.backbones[0].model)
+    source_backbone = {}
+    skipped_head = []
+    for key, value in checkpoint_state.items():
+        parsed = _yolo_layer_key(key)
+        if parsed is None:
+            continue
+        layer, suffix = parsed
+        if layer < backbone_layers:
+            source_backbone[(layer, suffix)] = value
+        else:
+            skipped_head.append((suffix, value))
+
+    if not source_backbone:
+        raise RuntimeError(
+            f"No YOLO backbone tensors were found in {weights} (checkpoint field: {source_field}). "
+            "Expected keys such as model.0.conv.weight."
+        )
+
+    target_state = model.state_dict()
+    target_parameters = dict(model.named_parameters())
+    transfer = {}
+    per_stream_param_counts = []
+    per_stream_state_counts = []
+    unmatched_source = []
+    shape_mismatches = []
+    unmatched_target_params = []
+
+    for stream in range(3):
+        stream_prefix = f"backbones.{stream}.model."
+        matched_keys = set()
+        loaded_parameter_values = 0
+        for (layer, suffix), value in source_backbone.items():
+            target_key = f"{stream_prefix}{layer}.{suffix}"
+            target_tensor = target_state.get(target_key)
+            if target_tensor is None:
+                if stream == 0:
+                    unmatched_source.append((layer, suffix))
+                continue
+            if target_tensor.shape != value.shape:
+                if stream == 0:
+                    shape_mismatches.append(
+                        (f"model.{layer}.{suffix}", tuple(value.shape), tuple(target_tensor.shape))
+                    )
+                continue
+            transfer[target_key] = value
+            matched_keys.add(target_key)
+            if target_key in target_parameters:
+                loaded_parameter_values += target_parameters[target_key].numel()
+
+        if not any(key.endswith(".model.0.conv.weight") for key in matched_keys):
+            raise RuntimeError(
+                f"Pretrained first convolution was not loaded into backbone {stream}. "
+                "Check that the checkpoint is a compatible 3-channel YOLOv3-Spp model."
+            )
+        if loaded_parameter_values == 0:
+            raise RuntimeError(f"No pretrained parameters were loaded into backbone {stream}.")
+
+        missing_parameter_keys = [
+            key
+            for key in target_parameters
+            if key.startswith(stream_prefix) and key not in matched_keys
+        ]
+        unmatched_target_params.append(
+            sum(target_parameters[key].numel() for key in missing_parameter_keys)
+        )
+        per_stream_param_counts.append(loaded_parameter_values)
+        per_stream_state_counts.append(len(matched_keys))
+
+    model.load_state_dict(transfer, strict=False)
+    LOGGER.info("Loading pretrained YOLOv3-Spp weights from %s (checkpoint field: %s)...", weights, source_field)
+    for stream_name, parameter_count, state_count in zip(
+        ("RGB", "IR", "Depth"), per_stream_param_counts, per_stream_state_counts
+    ):
+        LOGGER.info(
+            "Loaded pretrained weights into %s backbone: %s parameters (%d state tensors)",
+            stream_name,
+            f"{parameter_count:,}",
+            state_count,
+        )
+
+    skipped_head_values = sum(tensor.numel() for _, tensor in skipped_head)
+    skipped_head_parameters = [
+        tensor for suffix, tensor in skipped_head if suffix.rsplit(".", 1)[-1] in {"weight", "bias"}
+    ]
+    skipped_head_parameter_values = sum(tensor.numel() for tensor in skipped_head_parameters)
+    LOGGER.info(
+        "Pretrained transfer summary: loaded %s parameter values across 3 backbones; "
+        "unmatched source backbone tensors=%d; shape mismatches=%d; unmatched target parameter values=%s; "
+        "skipped Detection Head=%d parameter tensors (%s parameter values), %d state tensors "
+        "(%s total tensor values). Fusion and target head were not loaded.",
+        f"{sum(per_stream_param_counts):,}",
+        len(unmatched_source),
+        len(shape_mismatches),
+        f"{sum(unmatched_target_params):,}",
+        len(skipped_head_parameters),
+        f"{skipped_head_parameter_values:,}",
+        len(skipped_head),
+        f"{skipped_head_values:,}",
+    )
+    if unmatched_source:
+        LOGGER.warning("Unmatched pretrained backbone tensors: %s", unmatched_source[:10])
+    if shape_mismatches:
+        LOGGER.warning("Backbone tensor shape mismatches (source key, source shape, target shape): %s", shape_mismatches[:10])
+
+
 # 训练主循环:构建模型/优化器/数据加载器,逐 epoch 训练、验证并保存最优模型
 def train(hyp, opt, device, callbacks):
     """Train a YOLOv3 model on a custom dataset and manage the training process.
@@ -185,38 +336,36 @@ def train(hyp, opt, device, callbacks):
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch_load(weights, map_location="cpu")  # load checkpoint to CPU to avoid CUDA memory leak
-        model_cfg = cfg or ckpt["model"].yaml
+        checkpoint_model = ckpt.get("model") if isinstance(ckpt, dict) else ckpt
+        checkpoint_cfg = getattr(checkpoint_model, "yaml", None)
+        if isinstance(ckpt, dict):
+            checkpoint_cfg = checkpoint_cfg or ckpt.get("yaml") or ckpt.get("model_yaml") or ckpt.get("cfg")
+        model_cfg = cfg or checkpoint_cfg
+        if model_cfg is None:
+            raise ValueError(
+                f"No model configuration was provided and checkpoint {weights} does not contain a YOLO model yaml. "
+                "Pass --cfg explicitly."
+            )
         model = (
             MultiModalDetectionModel(model_cfg, ch=(3, 3, 3), nc=nc, anchors=hyp.get("anchors"))
             if multimodal
             else Model(model_cfg, ch=ch, nc=nc, anchors=hyp.get("anchors"))
         ).to(device)
         exclude = ["anchor"] if (cfg or hyp.get("anchors")) and not resume else []
-        csd = ckpt["model"].float().state_dict()  # checkpoint state_dict as FP32
-        if multimodal:
-            # Initialize every stream from the single-stream checkpoint where shapes match.
-            mapped = {}
-            for key, value in csd.items():
-                if key.startswith("backbones."):
-                    target_keys = [key]
-                elif key.startswith("model."):
-                    layer, _, suffix = key[6:].partition(".")
-                    if not layer.isdigit():
-                        continue
-                    layer_index = int(layer)
-                    target_keys = (
-                        [f"backbones.{stream}.model.{layer_index}.{suffix}" for stream in range(3)]
-                        if layer_index < 11
-                        else [f"model.{layer_index - 11}.{suffix}"]
-                    )
-                else:
-                    continue
-                for target_key in target_keys:
-                    mapped[target_key] = value
-            csd = mapped
-        csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)
-        model.load_state_dict(csd, strict=False)  # load
-        LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from {weights}")  # report
+        checkpoint_state, source_field = _state_dict_from_checkpoint(ckpt)
+        has_multimodal_backbones = any("backbones." in key for key in checkpoint_state)
+        if multimodal and not has_multimodal_backbones and not resume:
+            _load_single_yolo_backbone(checkpoint_state, model, weights, source_field)
+        else:
+            transferred = intersect_dicts(checkpoint_state, model.state_dict(), exclude=exclude)
+            model.load_state_dict(transferred, strict=False)
+            LOGGER.info(
+                "Transferred %d/%d matching state tensors from %s (checkpoint field: %s)",
+                len(transferred),
+                len(model.state_dict()),
+                weights,
+                source_field,
+            )
     else:
         model = (
             MultiModalDetectionModel(cfg, ch=(3, 3, 3), nc=nc, anchors=hyp.get("anchors"))
@@ -285,7 +434,7 @@ def train(hyp, opt, device, callbacks):
     if pretrained:
         if resume:
             best_fitness, start_epoch, epochs = smart_resume(ckpt, optimizer, ema, weights, epochs, resume)
-        del ckpt, csd
+        del ckpt, checkpoint_state
 
     # DP mode
     if cuda and RANK == -1 and torch.cuda.device_count() > 1:

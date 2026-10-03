@@ -1,8 +1,11 @@
 """Create a deterministic sample-level split for the tri-modal training set."""
 
+import os
 import random
 import shutil
 from pathlib import Path
+
+import cv2
 
 
 IMAGE_EXTENSIONS = {".bmp", ".dng", ".jpeg", ".jpg", ".mpo", ".png", ".pfm", ".tif", ".tiff", ".webp"}
@@ -46,14 +49,73 @@ def _validate_existing_split(split_root, expected_relative_paths, expected_label
             )
 
 
+def _verify_created_splits(root, modality_dirs, train_paths, val_paths, labels_dir):
+    if train_paths & val_paths:
+        raise RuntimeError("Generated train and validation sample sets overlap.")
+
+    split_samples = {}
+    for split_name, expected_paths in (("train", train_paths), ("val", val_paths)):
+        split_root = root / split_name
+        for source_root in modality_dirs.values():
+            modality_root = split_root / source_root.name
+            actual_paths = {path.relative_to(modality_root) for path in _image_files(modality_root)}
+            if actual_paths != expected_paths:
+                missing = sorted(expected_paths - actual_paths)
+                extra = sorted(actual_paths - expected_paths)
+                raise RuntimeError(
+                    f"Invalid {split_name} split in {modality_root}: "
+                    f"missing={missing[:5]}, extra={extra[:5]}"
+                )
+        split_samples[split_name] = {
+            path.relative_to(split_root / next(iter(modality_dirs.values())).name)
+            for path in _image_files(split_root / next(iter(modality_dirs.values())).name)
+        }
+
+        expected_label_names = {
+            f"{relative_path.stem}.txt"
+            for relative_path in expected_paths
+            if (labels_dir / f"{relative_path.stem}.txt").is_file()
+        }
+        actual_label_names = {path.name for path in (split_root / "labels").glob("*.txt")}
+        if actual_label_names != expected_label_names:
+            raise RuntimeError(
+                f"Invalid labels in {split_root / 'labels'}: "
+                f"missing={sorted(expected_label_names - actual_label_names)[:5]}, "
+                f"extra={sorted(actual_label_names - expected_label_names)[:5]}"
+            )
+
+    overlap = split_samples["train"] & split_samples["val"]
+    if overlap:
+        raise RuntimeError(f"Train/validation leakage detected: {sorted(overlap)[:5]}")
+    if split_samples["train"] | split_samples["val"] != train_paths | val_paths:
+        raise RuntimeError("The generated train and validation splits do not cover all source samples.")
+
+
 def _copy_sample(source_root, destination_root, relative_path):
     source = source_root / relative_path
     destination = destination_root / relative_path
     if not source.is_file():
         raise FileNotFoundError(f"Missing expected paired file: {source}")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if not destination.exists():
-        shutil.copy2(source, destination)
+    source_stat = source.stat()
+    destination_stat = destination.stat() if destination.exists() else None
+    if destination_stat and (
+        destination_stat.st_size == source_stat.st_size
+        and destination_stat.st_mtime_ns == source_stat.st_mtime_ns
+        and cv2.imread(str(destination)) is not None
+    ):
+        return False
+    if cv2.imread(str(source)) is None:
+        raise RuntimeError(f"Source image cannot be decoded by OpenCV: {source}")
+
+    temporary = destination.with_name(f"{destination.name}.split-tmp")
+    try:
+        shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return True
 
 
 def split_dataset(root, val_ratio=0.15, seed=42):
@@ -111,6 +173,7 @@ def split_dataset(root, val_ratio=0.15, seed=42):
     if train_paths & val_paths:
         raise RuntimeError("Train and validation split unexpectedly contain overlapping samples.")
 
+    refreshed_files = 0
     for split_name, relative_paths in (("train", train_paths), ("val", val_paths)):
         split_root = root / split_name
         expected_labels = {
@@ -122,7 +185,7 @@ def split_dataset(root, val_ratio=0.15, seed=42):
         for source_root in modality_dirs.values():
             destination_root = split_root / source_root.name
             for relative_path in relative_paths:
-                _copy_sample(source_root, destination_root, relative_path)
+                refreshed_files += _copy_sample(source_root, destination_root, relative_path)
         destination_labels = split_root / "labels"
         destination_labels.mkdir(parents=True, exist_ok=True)
         for relative_path in relative_paths:
@@ -130,7 +193,27 @@ def split_dataset(root, val_ratio=0.15, seed=42):
             source = labels_dir / label_name
             if source.is_file():
                 destination = destination_labels / label_name
-                if not destination.exists():
-                    shutil.copy2(source, destination)
+                source_stat = source.stat()
+                destination_stat = destination.stat() if destination.exists() else None
+                if not destination_stat or (
+                    destination_stat.st_size != source_stat.st_size
+                    or destination_stat.st_mtime_ns != source_stat.st_mtime_ns
+                ):
+                    temporary = destination.with_name(f"{destination.name}.split-tmp")
+                    try:
+                        shutil.copy2(source, temporary)
+                        os.replace(temporary, destination)
+                    finally:
+                        if temporary.exists():
+                            temporary.unlink()
+                    refreshed_files += 1
 
+    if refreshed_files:
+        print(f"Refreshed {refreshed_files} missing or stale split files from the source dataset.")
+
+    _verify_created_splits(root, modality_dirs, train_paths, val_paths, labels_dir)
+    print(
+        f"Verified split: train={len(train_paths)}, val={len(val_paths)}, overlap=0, "
+        f"modalities={', '.join(source_root.name for source_root in modality_dirs.values())}"
+    )
     return root / "train", root / "val", len(train_paths), len(val_paths)

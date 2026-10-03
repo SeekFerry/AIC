@@ -365,6 +365,7 @@ class LoadImagesAndLabels(Dataset):
         self.modalities = tuple(modalities or MODALITY_DIRS)
         self.multimodal = False
         self.albumentations = Albumentations(size=img_size) if augment else None
+        modal_paths_by_anchor = None
 
         try:
             f = []  # image files
@@ -400,6 +401,36 @@ class LoadImagesAndLabels(Dataset):
                         assert os.path.isfile(mf), f"{prefix}Missing paired image {mf}"
                         files.append(mf)
                     modal_files.append(files)
+
+                valid_indices = []
+                unreadable = []
+                for image_index, anchor_file in enumerate(anchor_files):
+                    bad_paths = [
+                        modal_files[modality_index][image_index]
+                        for modality_index in range(len(modal_files))
+                        if cv2.imread(modal_files[modality_index][image_index]) is None
+                    ]
+                    if bad_paths:
+                        unreadable.append((anchor_file, bad_paths))
+                    else:
+                        valid_indices.append(image_index)
+
+                if unreadable:
+                    LOGGER.warning(
+                        "%sSkipping %d tri-modal samples because at least one paired image cannot be decoded by "
+                        "OpenCV. The complete RGB/IR/Depth/label sample is excluded. First failures: %s",
+                        prefix,
+                        len(unreadable),
+                        [
+                            {"anchor": anchor, "unreadable_modalities": bad}
+                            for anchor, bad in unreadable[:10]
+                        ],
+                    )
+                    anchor_files = [anchor_files[i] for i in valid_indices]
+                    modal_files = [[files[i] for i in valid_indices] for files in modal_files]
+                    if not anchor_files:
+                        raise RuntimeError(f"{prefix}No tri-modal samples remain after checking image readability.")
+
                 f = anchor_files
             else:
                 for p in path if isinstance(path, list) else [path]:
@@ -420,6 +451,12 @@ class LoadImagesAndLabels(Dataset):
             assert self.im_files, f"{prefix}No images found"
             if modal_files is not None:
                 self.modal_im_files = modal_files  # 与 self.im_files 顺序严格一致
+                modal_paths_by_anchor = {
+                    os.path.normcase(os.path.abspath(anchor_file)): tuple(
+                        files[index] for files in modal_files
+                    )
+                    for index, anchor_file in enumerate(self.im_files)
+                }
         except Exception as e:
             raise RuntimeError(f"{prefix}Error loading data from {path}: {e}\n{HELP_URL}") from e
 
@@ -461,6 +498,17 @@ class LoadImagesAndLabels(Dataset):
         self.shapes = np.array(shapes)
         self.im_files = list(cache.keys())  # update
         if self.multimodal:
+            try:
+                self.modal_im_files = [
+                    [modal_paths_by_anchor[os.path.normcase(os.path.abspath(anchor))][modality_index]
+                     for anchor in self.im_files]
+                    for modality_index in range(len(self.modalities))
+                ]
+            except (KeyError, TypeError) as error:
+                raise RuntimeError(
+                    f"{prefix}Could not realign modality paths with cached anchor images. "
+                    "The image cache contains an anchor that was not present in the paired image list."
+                ) from error
             self.label_files = [_modal_to_label(f, self.label_root) for f in self.im_files]  # update
         else:
             self.label_files = img2label_paths(cache.keys())  # update
@@ -704,7 +752,12 @@ class LoadImagesAndLabels(Dataset):
             h0 = w0 = None
             for files in self.modal_im_files:
                 im = cv2.imread(files[i])  # BGR
-                assert im is not None, f"Image Not Found {files[i]}"
+                if im is None:
+                    raise RuntimeError(
+                        f"OpenCV could not decode paired image {files[i]!r} during data loading. "
+                        "The sample passed the initial readability scan; check for file corruption, permissions, "
+                        "or concurrent changes to the dataset."
+                    )
                 if h0 is None:
                     h0, w0 = im.shape[:2]  # orig hw(三个模态对应同一张照片,尺寸一致)
                     r = self.img_size / max(h0, w0)  # ratio
