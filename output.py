@@ -32,7 +32,7 @@ REPO_ROOT = FILE.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-from data import letterbox  # noqa: E402
+from data import letterbox, load_depth_image  # noqa: E402
 from train.utils.experimental import attempt_load  # noqa: E402
 from train.utils.general import (  # noqa: E402
     LOGGER,
@@ -100,12 +100,12 @@ def is_multi_stream(model):
 
 # 读取三个模态 -> 共享同一套 letterbox -> 各自转成 (1,3,H,W) 张量。
 # 返回: [visible, infrared, depth] 三个张量, 原图尺寸 (h0, w0), letterbox 参数 (ratio, pad)
-def load_multimodal_tensor(files, imgsz, stride):
+def load_multimodal_tensor(files, imgsz, stride, log_depth_stats=False):
     """Load visible/infrared/depth images with one shared letterbox and return per-modality tensors."""
     ims = []
     h0 = w0 = None
-    for f in files:
-        im = cv2.imread(str(f))  # BGR
+    for modality_index, f in enumerate(files):
+        im = load_depth_image(f, log_stats=log_depth_stats) if modality_index == 2 else cv2.imread(str(f))
         assert im is not None, f"Image Not Found {f}"
         if h0 is None:
             h0, w0 = im.shape[:2]
@@ -185,13 +185,15 @@ def run(
     multi_stream = is_multi_stream(model)  # True: 三流模型(分开输入) / False: 9 通道早融合
     LOGGER.info(f"Model type: {'three-stream (visible/infrared/depth)' if multi_stream else 'single-stream (9-channel early fusion)'}")
 
-    for vis_f in TQDM(vis_files, desc="Predicting"):
+    for image_index, vis_f in enumerate(TQDM(vis_files, desc="Predicting")):
         rel = vis_f.relative_to(vis_dir)
         files = [vis_f, ir_dir / rel, dep_dir / rel]
         for f in files[1:]:
             assert f.is_file(), f"Missing paired image {f}"
 
-        tensors, (h0, w0), ratio_pad = load_multimodal_tensor(files, imgsz, stride)
+        tensors, (h0, w0), ratio_pad = load_multimodal_tensor(
+            files, imgsz, stride, log_depth_stats=image_index < 3
+        )
         tensors = [t.to(device, non_blocking=True) for t in tensors]
         tensors = [t.half() if half else t.float() for t in tensors]
 

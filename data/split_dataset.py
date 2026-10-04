@@ -7,6 +7,8 @@ from pathlib import Path
 
 import cv2
 
+from .dataset import load_depth_image
+
 
 IMAGE_EXTENSIONS = {".bmp", ".dng", ".jpeg", ".jpg", ".mpo", ".png", ".pfm", ".tif", ".tiff", ".webp"}
 
@@ -91,7 +93,7 @@ def _verify_created_splits(root, modality_dirs, train_paths, val_paths, labels_d
         raise RuntimeError("The generated train and validation splits do not cover all source samples.")
 
 
-def _copy_sample(source_root, destination_root, relative_path):
+def _copy_sample(source_root, destination_root, relative_path, is_depth=False):
     source = source_root / relative_path
     destination = destination_root / relative_path
     if not source.is_file():
@@ -99,13 +101,25 @@ def _copy_sample(source_root, destination_root, relative_path):
     destination.parent.mkdir(parents=True, exist_ok=True)
     source_stat = source.stat()
     destination_stat = destination.stat() if destination.exists() else None
+
+    def is_readable(path, invalid_is_false=False):
+        try:
+            if is_depth:
+                load_depth_image(path)
+                return True
+            return cv2.imread(str(path)) is not None
+        except (RuntimeError, ValueError):
+            if invalid_is_false:
+                return False
+            raise
+
     if destination_stat and (
         destination_stat.st_size == source_stat.st_size
         and destination_stat.st_mtime_ns == source_stat.st_mtime_ns
-        and cv2.imread(str(destination)) is not None
+        and is_readable(destination, invalid_is_false=True)
     ):
         return False
-    if cv2.imread(str(source)) is None:
+    if not is_readable(source):
         raise RuntimeError(f"Source image cannot be decoded by OpenCV: {source}")
 
     temporary = destination.with_name(f"{destination.name}.split-tmp")
@@ -185,7 +199,12 @@ def split_dataset(root, val_ratio=0.15, seed=42):
         for source_root in modality_dirs.values():
             destination_root = split_root / source_root.name
             for relative_path in relative_paths:
-                refreshed_files += _copy_sample(source_root, destination_root, relative_path)
+                refreshed_files += _copy_sample(
+                    source_root,
+                    destination_root,
+                    relative_path,
+                    is_depth=source_root == modality_dirs["depth"],
+                )
         destination_labels = split_root / "labels"
         destination_labels.mkdir(parents=True, exist_ok=True)
         for relative_path in relative_paths:

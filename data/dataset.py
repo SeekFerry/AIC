@@ -49,6 +49,74 @@ for orientation in ExifTags.TAGS:
 # 三模态比赛数据集:根目录下的模态文件夹(以第一个为锚点,同名文件一一对应)。
 MODALITY_DIRS = ("visible", "infared", "depth")
 LABEL_DIR_NAMES = ("labels",)
+DEPTH_MAX_MM = 20000.0
+
+
+def load_depth_image(path, log_stats=False):
+    """Load a depth image as a three-channel uint8 image using stable metric scaling."""
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix == ".png":
+        raw = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if raw is None:
+            raise RuntimeError(f"OpenCV could not decode depth image {path}")
+        if raw.ndim == 3 and raw.shape[2] == 1:
+            raw = raw[:, :, 0]
+        if raw.dtype != np.uint16 or raw.ndim != 2:
+            raise ValueError(
+                f"Expected a single-channel uint16 PNG depth image, got dtype={raw.dtype}, shape={raw.shape} "
+                f"for {path}"
+            )
+        depth = np.clip(raw.astype(np.float32), 0, DEPTH_MAX_MM)
+        depth = (depth / DEPTH_MAX_MM * 255.0).astype(np.uint8)
+        depth = np.repeat(depth[..., None], 3, axis=2)
+    elif suffix in {".jpg", ".jpeg"}:
+        raw = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        if raw is None:
+            raise RuntimeError(f"OpenCV could not decode depth image {path}")
+        if raw.ndim == 3 and raw.shape[2] == 1:
+            raw = raw[:, :, 0]
+        depth = np.repeat(raw[..., None], 3, axis=2)
+    else:
+        raw = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if raw is None:
+            raise RuntimeError(f"OpenCV could not decode depth image {path}")
+        if raw.ndim == 3 and raw.shape[2] == 1:
+            raw = raw[:, :, 0]
+        if raw.dtype == np.uint16 and raw.ndim == 2:
+            depth = np.clip(raw.astype(np.float32), 0, DEPTH_MAX_MM)
+            depth = (depth / DEPTH_MAX_MM * 255.0).astype(np.uint8)
+            depth = np.repeat(depth[..., None], 3, axis=2)
+        elif raw.dtype == np.uint8 and raw.ndim == 2:
+            depth = np.repeat(raw[..., None], 3, axis=2)
+        elif raw.dtype == np.uint8 and raw.ndim == 3 and raw.shape[2] in (3, 4):
+            color_conversion = cv2.COLOR_BGR2GRAY if raw.shape[2] == 3 else cv2.COLOR_BGRA2GRAY
+            gray = cv2.cvtColor(raw, color_conversion)
+            depth = np.repeat(gray[..., None], 3, axis=2)
+        else:
+            raise ValueError(
+                f"Unsupported depth image dtype/shape: dtype={raw.dtype}, shape={raw.shape} for {path}"
+            )
+
+    if log_stats:
+        LOGGER.info(
+            "Depth preprocessing: path=%s raw(dtype=%s, shape=%s, min=%s, max=%s, mean=%.3f, zero_ratio=%.4f) "
+            "processed(dtype=%s, shape=%s, min=%d, max=%d, mean=%.3f, zero_ratio=%.4f)",
+            path,
+            raw.dtype,
+            raw.shape,
+            np.min(raw),
+            np.max(raw),
+            float(np.mean(raw)),
+            float(np.count_nonzero(raw == 0) / raw.size),
+            depth.dtype,
+            depth.shape,
+            int(depth.min()),
+            int(depth.max()),
+            float(depth.mean()),
+            float(np.count_nonzero(depth == 0) / depth.size),
+        )
+    return depth
 
 
 # 解析某个模态的实际目录,兼容 infared/infrared 的拼写差异。
@@ -404,12 +472,18 @@ class LoadImagesAndLabels(Dataset):
 
                 valid_indices = []
                 unreadable = []
+                depth_index = next((i for i, name in enumerate(self.modalities) if name == "depth"), None)
                 for image_index, anchor_file in enumerate(anchor_files):
-                    bad_paths = [
-                        modal_files[modality_index][image_index]
-                        for modality_index in range(len(modal_files))
-                        if cv2.imread(modal_files[modality_index][image_index]) is None
-                    ]
+                    bad_paths = []
+                    for modality_index in range(len(modal_files)):
+                        modality_path = modal_files[modality_index][image_index]
+                        if modality_index == depth_index:
+                            try:
+                                load_depth_image(modality_path, log_stats=image_index < 3)
+                            except RuntimeError:
+                                bad_paths.append(modality_path)
+                        elif cv2.imread(modality_path) is None:
+                            bad_paths.append(modality_path)
                     if bad_paths:
                         unreadable.append((anchor_file, bad_paths))
                     else:
@@ -750,8 +824,13 @@ class LoadImagesAndLabels(Dataset):
         if self.multimodal:
             ims = []
             h0 = w0 = None
-            for files in self.modal_im_files:
-                im = cv2.imread(files[i])  # BGR
+            depth_index = next((j for j, name in enumerate(self.modalities) if name == "depth"), None)
+            for modality_index, files in enumerate(self.modal_im_files):
+                im = (
+                    load_depth_image(files[i])
+                    if modality_index == depth_index
+                    else cv2.imread(files[i])
+                )  # BGR; depth uses the shared depth preprocessor
                 if im is None:
                     raise RuntimeError(
                         f"OpenCV could not decode paired image {files[i]!r} during data loading. "

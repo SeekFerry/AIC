@@ -25,6 +25,7 @@ from .dataset import (
     create_dataloader,
     dataset_num_modalities,
     exif_size,
+    load_depth_image,
     verify_image_label,
 )
 from .transforms import (
@@ -62,6 +63,7 @@ __all__ = [
     "create_dataloader",
     "dataset_num_modalities",
     "exif_size",
+    "load_depth_image",
     "verify_image_label",
     # transforms.py
     "Albumentations",
